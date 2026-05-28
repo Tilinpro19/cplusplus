@@ -6,6 +6,7 @@
 #include <future>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 using namespace std;
 
@@ -90,16 +91,46 @@ bool validar_orden(const vector<float>& vec){
     return true;
 }
 
+// Lectura ultra rapida: lee TODO el archivo de una vez a un bloque y luego
+// parsea los numeros con strtof. Evita el cuello de botella de "in >> num".
+static bool leerArchivo(const char* ruta, vector<float>& out){
+    ifstream in(ruta, ios::binary | ios::ate);
+    if(!in) return false;
+
+    streamsize size = in.tellg();
+    in.seekg(0, ios::beg);
+
+    vector<char> blob((size_t)size + 1);
+    if(!in.read(blob.data(), size)) return false;
+    blob[(size_t)size] = '\0';
+
+    out.clear();
+    out.reserve(20000000);
+
+    const char* p = blob.data();
+    char* end = nullptr;
+    while(true){
+        float v = strtof(p, &end);
+        if(p == end) break;          // ya no hay mas numeros
+        out.push_back(v);
+        p = end;
+    }
+    return true;
+}
+
 int main(){
     vector<float> numbers;
-    ifstream in("output.txt");
 
-    float num;
-    while(in >> num){
-        numbers.push_back(num);
+    auto loadStart = chrono::high_resolution_clock::now();
+    if(!leerArchivo("datos.txt", numbers)){
+        cout << "ERROR: no se pudo abrir 'datos.txt'" << endl;
+        return 1;
     }
-    in.close();
+    auto loadEnd = chrono::high_resolution_clock::now();
+    auto loadMs = chrono::duration_cast<chrono::milliseconds>(loadEnd - loadStart);
+
     cout << "Vector (size): " << numbers.size() << endl;
+    cout << "Tiempo de carga: " << loadMs.count() << " mili." << endl;
 
     auto start = chrono::high_resolution_clock::now();
 
