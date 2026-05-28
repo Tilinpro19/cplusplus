@@ -10,16 +10,13 @@
 using namespace std;
 
 // ---------------------------------------------------------------------------
-// Parametros de ajuste
+// Parametros de ajuste del merge sort paralelo
 // ---------------------------------------------------------------------------
 static const int    INS_CUTOFF = 32;     // por debajo de esto: insertion sort
 static const size_t PAR_MIN    = 50000;  // rango minimo para lanzar un hilo
 static int          g_maxDepth = 3;      // se calcula segun los nucleos de la CPU
 
-// ---------------------------------------------------------------------------
 // Insertion sort para rangos pequenos [lo, hi] (inclusivo).
-// Opera sobre el buffer destino, que ya contiene los valores originales.
-// ---------------------------------------------------------------------------
 static inline void insertionSort(float* a, size_t lo, size_t hi){
     for(size_t i = lo + 1; i <= hi; ++i){
         float key = a[i];
@@ -32,13 +29,9 @@ static inline void insertionSort(float* a, size_t lo, size_t hi){
     }
 }
 
-// ---------------------------------------------------------------------------
 // Mezcla las dos mitades ordenadas de src en dst sobre [lo, hi] (inclusivo).
-//   mitad izquierda = src[lo   .. mid]
-//   mitad derecha   = src[mid+1.. hi]
-// Usa el unico buffer auxiliar pasado por puntero (sin asignar memoria aqui).
-// Los segmentos son disjuntos en memoria: seguro entre hilos sin mutex.
-// ---------------------------------------------------------------------------
+// Usa el unico buffer auxiliar (sin asignar memoria aqui). Segmentos disjuntos:
+// seguro entre hilos sin mutex.
 static void merge(const float* src, float* dst, size_t lo, size_t mid, size_t hi){
     size_t i = lo, j = mid + 1, k = lo;
     while(i <= mid && j <= hi){
@@ -49,21 +42,14 @@ static void merge(const float* src, float* dst, size_t lo, size_t mid, size_t hi
     while(j <= hi)  dst[k++] = src[j++];
 }
 
-// ---------------------------------------------------------------------------
-// Merge sort paralelo con esquema ping-pong (sin copia de retorno).
-// Los roles de src/dst se intercambian en cada nivel; el resultado de
-// sort(src, dst, lo, hi) queda en dst[lo..hi]. Precondicion: src y dst
-// contienen datos identicos al entrar (se garantiza con la copia inicial).
-//
-// Concurrencia: mientras estamos "poco profundos" en el arbol
-// (depth < g_maxDepth) la mitad izquierda se manda a un std::thread y se
-// sincroniza con std::promise / std::future. Mas abajo todo es secuencial
-// para no saturar la CPU con hilos.
-// ---------------------------------------------------------------------------
-static void sort(float* src, float* dst, size_t lo, size_t hi, int depth){
-    if(hi <= lo) return;                         // 0 o 1 elemento: ya esta en dst
+// Merge sort paralelo (ping-pong: src/dst alternan roles por nivel, sin copia
+// de retorno; el resultado de sort(src,dst,lo,hi) queda en dst[lo..hi]).
+// Concurrencia con std::thread + std::promise + std::future mientras
+// depth < g_maxDepth; mas abajo, secuencial.
+static void mergeSort(float* src, float* dst, size_t lo, size_t hi, int depth){
+    if(hi <= lo) return;
 
-    if(hi - lo < (size_t)INS_CUTOFF){            // rango pequeno
+    if(hi - lo < (size_t)INS_CUTOFF){
         insertionSort(dst, lo, hi);
         return;
     }
@@ -71,27 +57,24 @@ static void sort(float* src, float* dst, size_t lo, size_t hi, int depth){
     size_t mid = lo + (hi - lo) / 2;
 
     if(depth < g_maxDepth && (hi - lo) > PAR_MIN){
-        // ---- Rama paralela: mitad izquierda en un hilo trabajador --------
         promise<void> promiseIzquierdo;
         future<void>  futureIzquierdo = promiseIzquierdo.get_future();
 
         thread hiloIzquierdo([&](){
-            sort(dst, src, lo, mid, depth + 1);  // roles intercambiados
+            mergeSort(dst, src, lo, mid, depth + 1);   // roles intercambiados
             promiseIzquierdo.set_value();
         });
 
-        sort(dst, src, mid + 1, hi, depth + 1);  // mitad derecha en el hilo actual
+        mergeSort(dst, src, mid + 1, hi, depth + 1);   // mitad derecha aqui
 
-        futureIzquierdo.get();                   // espera el resultado izquierdo
+        futureIzquierdo.get();
         hiloIzquierdo.join();
     } else {
-        // ---- Rama secuencial --------------------------------------------
-        sort(dst, src, lo, mid, depth + 1);
-        sort(dst, src, mid + 1, hi, depth + 1);
+        mergeSort(dst, src, lo, mid, depth + 1);
+        mergeSort(dst, src, mid + 1, hi, depth + 1);
     }
 
-    // Las mitades ordenadas quedaron en src. Se mezclan hacia dst.
-    if(src[mid] <= src[mid + 1]){                // camino rapido: ya ordenado
+    if(src[mid] <= src[mid + 1]){                      // camino rapido: ya ordenado
         memcpy(dst + lo, src + lo, (hi - lo + 1) * sizeof(float));
     } else {
         merge(src, dst, lo, mid, hi);
@@ -108,9 +91,6 @@ bool validar_orden(const vector<float>& vec){
 }
 
 int main(){
-    ios_base::sync_with_stdio(false);
-    cin.tie(NULL);
-
     vector<float> numbers;
     ifstream in("output.txt");
 
@@ -121,26 +101,17 @@ int main(){
     in.close();
     cout << "Vector (size): " << numbers.size() << endl;
 
-    const size_t n = numbers.size();
-    if(n == 0){
-        cout << "Archivo vacio o no encontrado." << endl;
-        return 1;
-    }
-
-    // Configura el paralelismo segun la CPU real
-    unsigned hc = thread::hardware_concurrency();
-    if(hc == 0) hc = 8;
-    g_maxDepth = (int)ceil(log2((double)hc));
-    cout << "Hilos de hardware: " << hc
-         << " (profundidad paralela = " << g_maxDepth << ")" << endl;
-
-    // UN solo buffer auxiliar, asignado una vez, usado como espacio de trabajo
-    vector<float> buffer(numbers);   // copia identica => invariante del ping-pong
-
     auto start = chrono::high_resolution_clock::now();
 
-    // src = buffer, dst = numbers  ->  el resultado ordenado queda en numbers
-    sort(buffer.data(), numbers.data(), 0, n - 1, 0);
+    // Aqui debe ir el algoritmo de ordenamiento...
+    if(numbers.size() > 1){
+        unsigned hc = thread::hardware_concurrency();
+        if(hc == 0) hc = 8;
+        g_maxDepth = (int)ceil(log2((double)hc));     // ~1 tarea por nucleo
+
+        vector<float> buffer(numbers);                // UN buffer auxiliar (copia)
+        mergeSort(buffer.data(), numbers.data(), 0, numbers.size() - 1, 0);
+    }
 
     auto end = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
