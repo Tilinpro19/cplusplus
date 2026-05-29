@@ -1,119 +1,162 @@
 // ============================================================================
-//  HPC parallel sort of 20M floats from datos.txt
-//  - OpenMP task-based parallel merge sort (zero std::thread creation)
-//  - Per-thread chunked parsing with a locale-free SWAR-style float parser
-//  - Single ping-pong scratch buffer (no per-call allocations)
+//  Ultra-fast sort of 20,000,000 floats from datos.txt
+//
+//  Sort algorithm: Parallel LSD Radix Sort over the IEEE-754 bit pattern.
+//    - encode(float)  : bit-pattern transform that preserves total float order
+//                       in unsigned 32-bit space (sign-aware bit flip).
+//    - 4 LSD passes of 8 bits each, parallelized with OpenMP.
+//    - decode back to float in place.
 //
 //  Build:
-//      GCC  : g++ -O3 -march=native -std=c++20 -fopenmp main.cpp -o main
-//      Clang: clang++ -O3 -march=native -std=c++20 -fopenmp main.cpp -o main
-//      MSVC : cl /O2 /std:c++20 /openmp:llvm /EHsc main.cpp
+//      g++ -O3 -march=native -std=c++20 -fopenmp main.cpp -o main
+//      clang++ -O3 -march=native -std=c++20 -fopenmp main.cpp -o main
+//      cl /O2 /std:c++20 /openmp:llvm /EHsc main.cpp
 // ============================================================================
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <chrono>
-#include <thread>
-#include <cmath>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <array>
+#include <thread>
+#include <algorithm>
 #include <omp.h>
 
 using namespace std;
 
 // ---------------------------------------------------------------------------
-// Sort tuning
+// IEEE-754 order-preserving bit transform
+//   - Positives (sign bit 0)  -> flip only the sign bit (becomes 1xxx..).
+//   - Negatives (sign bit 1)  -> flip every bit         (becomes 0xxx..).
+// After encode, ascending uint32_t order == ascending float order.
 // ---------------------------------------------------------------------------
-static constexpr size_t INS_CUTOFF = 64;        // insertion sort threshold
-static constexpr size_t PAR_MIN    = 32'768;    // min range to spawn an OMP task
+static inline uint32_t encodeFloat(float f) noexcept {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    uint32_t mask = (uint32_t)(-(int32_t)(u >> 31)) | 0x80000000u;
+    return u ^ mask;
+}
+
+static inline float decodeFloat(uint32_t u) noexcept {
+    uint32_t mask = ((u >> 31) - 1u) | 0x80000000u;
+    uint32_t r = u ^ mask;
+    float f;
+    std::memcpy(&f, &r, sizeof(f));
+    return f;
+}
 
 // ---------------------------------------------------------------------------
-// Insertion sort over dst[lo..hi]  (inclusive)
+// Parallel LSD Radix Sort (4 passes of 8 bits) over uint32_t keys.
+//   keys : input/output array (sorted in place on return)
+//   aux  : scratch buffer of identical size
+//   n    : number of elements
+// Per-thread histograms eliminate atomics; per-thread offset cursors avoid
+// false sharing during the scatter phase.
 // ---------------------------------------------------------------------------
-static inline void insertionSort(float* __restrict a, size_t lo, size_t hi) noexcept {
-    for (size_t i = lo + 1; i <= hi; ++i) {
-        float key = a[i];
-        size_t j = i;
-        while (j > lo && a[j - 1] > key) {
-            a[j] = a[j - 1];
-            --j;
+static void parallelRadixSortU32(uint32_t* keys, uint32_t* aux, size_t n) noexcept {
+    const int T = std::max(1, omp_get_max_threads());
+
+    // Per-thread histograms (T x 256). We reuse them across passes.
+    vector<array<size_t, 256>> hist(static_cast<size_t>(T));
+    vector<array<size_t, 256>> off (static_cast<size_t>(T));
+
+    uint32_t* src = keys;
+    uint32_t* dst = aux;
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = pass * 8;
+
+        // ---- Reset histograms -----------------------------------------
+        for (int t = 0; t < T; ++t) hist[t].fill(0);
+
+        // ---- Pass 1: per-thread histogram of bucket counts ------------
+        #pragma omp parallel num_threads(T)
+        {
+            const int tid = omp_get_thread_num();
+            auto& myHist  = hist[static_cast<size_t>(tid)];
+            #pragma omp for schedule(static)
+            for (long long i = 0; i < static_cast<long long>(n); ++i) {
+                ++myHist[(src[i] >> shift) & 0xFFu];
+            }
         }
-        a[j] = key;
+
+        // ---- Prefix sum across all (bucket, thread) pairs -------------
+        size_t cum = 0;
+        for (int b = 0; b < 256; ++b) {
+            for (int t = 0; t < T; ++t) {
+                off[static_cast<size_t>(t)][static_cast<size_t>(b)] = cum;
+                cum += hist[static_cast<size_t>(t)][static_cast<size_t>(b)];
+            }
+        }
+
+        // ---- Pass 2: scatter to dst using thread-local cursors --------
+        #pragma omp parallel num_threads(T)
+        {
+            const int tid = omp_get_thread_num();
+            size_t local[256];
+            std::memcpy(local,
+                        off[static_cast<size_t>(tid)].data(),
+                        sizeof(local));
+            #pragma omp for schedule(static)
+            for (long long i = 0; i < static_cast<long long>(n); ++i) {
+                const uint32_t v = src[i];
+                const size_t   p = local[(v >> shift) & 0xFFu]++;
+                dst[p] = v;
+            }
+        }
+
+        std::swap(src, dst);
+    }
+
+    // After 4 swaps, src == keys: result already lives in `keys`. No copy.
+}
+
+// ---------------------------------------------------------------------------
+// Sort a vector<float> using the radix sort above.
+// Allocates one uint32_t keys buffer and one uint32_t scratch buffer.
+// ---------------------------------------------------------------------------
+static void sortFloats(vector<float>& v) noexcept {
+    const size_t n = v.size();
+    if (n < 2) return;
+
+    vector<uint32_t> keys(n);
+    vector<uint32_t> aux(n);
+
+    // Encode floats -> order-preserving uint32 keys.
+    #pragma omp parallel for schedule(static)
+    for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        keys[i] = encodeFloat(v[i]);
+    }
+
+    parallelRadixSortU32(keys.data(), aux.data(), n);
+
+    // Decode keys back to floats, writing in place over the original vector.
+    #pragma omp parallel for schedule(static)
+    for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        v[i] = decodeFloat(keys[i]);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Merge two sorted halves of src into dst, range [lo,hi] inclusive.
-//   left  = src[lo  ..mid]
-//   right = src[mid+1..hi]
-// Restrict qualifiers let the compiler vectorize the streaming loops.
+// Verification: parallel, kept functionally identical (returns bool).
 // ---------------------------------------------------------------------------
-static inline void mergeRanges(const float* __restrict src,
-                               float* __restrict dst,
-                               size_t lo, size_t mid, size_t hi) noexcept {
-    size_t i = lo, j = mid + 1, k = lo;
-    while (i <= mid && j <= hi) {
-        if (src[i] <= src[j]) dst[k++] = src[i++];
-        else                  dst[k++] = src[j++];
-    }
-    while (i <= mid) dst[k++] = src[i++];
-    while (j <= hi)  dst[k++] = src[j++];
-}
-
-// ---------------------------------------------------------------------------
-// Ping-pong merge sort (Sedgewick scheme).
-// Result of mergeSort(src,dst,lo,hi) is written to dst[lo..hi].
-// Children are called with swapped roles, so no copy-back is ever needed.
-// Concurrency: OpenMP tasks running on a persistent worker pool.
-// ---------------------------------------------------------------------------
-static void mergeSort(float* src, float* dst, size_t lo, size_t hi) noexcept {
-    if (hi <= lo) return;
-
-    if (hi - lo < INS_CUTOFF) {
-        insertionSort(dst, lo, hi);
-        return;
-    }
-
-    const size_t mid = lo + (hi - lo) / 2;
-
-    if (hi - lo > PAR_MIN) {
-        #pragma omp task default(none) firstprivate(src, dst, lo, mid)
-        mergeSort(dst, src, lo, mid);
-
-        mergeSort(dst, src, mid + 1, hi);
-
-        #pragma omp taskwait
-    } else {
-        mergeSort(dst, src, lo, mid);
-        mergeSort(dst, src, mid + 1, hi);
-    }
-
-    // Sorted halves now live in src; merge them into dst.
-    if (src[mid] <= src[mid + 1]) {                // already in order
-        memcpy(dst + lo, src + lo, (hi - lo + 1) * sizeof(float));
-    } else {
-        mergeRanges(src, dst, lo, mid, hi);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Verification: kept functional, parallelized with a reduction.
-// ---------------------------------------------------------------------------
-bool validar_orden(const vector<float>& vec) noexcept {
+bool validar_orden(const vector<float>& vec) {
     if (vec.size() < 2) return true;
     const float* a = vec.data();
-    const ptrdiff_t n = static_cast<ptrdiff_t>(vec.size());
+    const long long n = static_cast<long long>(vec.size());
     int bad = 0;
     #pragma omp parallel for reduction(+:bad) schedule(static)
-    for (ptrdiff_t i = 1; i < n; ++i) {
+    for (long long i = 1; i < n; ++i) {
         if (a[i] < a[i - 1]) bad = 1;
     }
     return bad == 0;
 }
 
 // ---------------------------------------------------------------------------
-// Ultra-fast, locale-free float parser. No exceptions, no allocations.
-// Handles optional sign, decimal point, and exponent (e/E +/- digits).
+// Fast, locale-free float parser used by the parallel file loader.
+// Handles optional sign, fractional part, and decimal exponent.
 // ---------------------------------------------------------------------------
 static const double kPow10[] = {
     1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
@@ -122,14 +165,8 @@ static const double kPow10[] = {
 };
 
 static inline double pow10fast(int e) noexcept {
-    if (e >= 0) {
-        if (e <= 22) return kPow10[e];
-        return std::pow(10.0, e);
-    } else {
-        int ne = -e;
-        if (ne <= 22) return 1.0 / kPow10[ne];
-        return std::pow(10.0, e);
-    }
+    if (e >= 0)  return (e <= 22) ? kPow10[e]      : std::pow(10.0,  e);
+    int ne = -e; return (ne <= 22) ? 1.0 / kPow10[ne] : std::pow(10.0, e);
 }
 
 static inline bool isWs(char c) noexcept {
@@ -141,12 +178,11 @@ static inline float parseFloat(const char*& p, const char* end) noexcept {
     if (p < end && (*p == '-' || *p == '+')) { neg = (*p == '-'); ++p; }
 
     uint64_t mantissa = 0;
-    int      digits   = 0;
     while (p < end) {
         unsigned c = static_cast<unsigned>(*p) - '0';
         if (c > 9) break;
         mantissa = mantissa * 10 + c;
-        ++p; ++digits;
+        ++p;
     }
 
     int fracDigits = 0;
@@ -156,7 +192,8 @@ static inline float parseFloat(const char*& p, const char* end) noexcept {
             unsigned c = static_cast<unsigned>(*p) - '0';
             if (c > 9) break;
             mantissa = mantissa * 10 + c;
-            ++p; ++fracDigits;
+            ++p;
+            ++fracDigits;
         }
     }
 
@@ -181,11 +218,9 @@ static inline float parseFloat(const char*& p, const char* end) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Parallel file loader.
-//   1. Single blocking read of the whole file into a contiguous blob.
-//   2. Cut the blob into N chunks aligned to newline boundaries.
-//   3. Each OMP thread parses its chunk into a thread-local vector.
-//   4. Prefix-sum offsets and parallel memcpy into the final array.
+// Parallel file loader. One single read() into a contiguous blob, chunked at
+// newline boundaries, then parsed in parallel into per-thread vectors and
+// concatenated via parallel memcpy into the final vector<float>.
 // ---------------------------------------------------------------------------
 static bool leerArchivo(const char* ruta, vector<float>& out) {
     ifstream in(ruta, ios::binary | ios::ate);
@@ -202,15 +237,14 @@ static bool leerArchivo(const char* ruta, vector<float>& out) {
     const size_t total = static_cast<size_t>(size);
     const int    T     = std::max(1, omp_get_max_threads());
 
-    // Chunk boundaries aligned to '\n'
     vector<size_t> starts(static_cast<size_t>(T) + 1);
     starts[0] = 0;
-    starts[T] = total;
+    starts[static_cast<size_t>(T)] = total;
     for (int t = 1; t < T; ++t) {
         size_t pos = total * static_cast<size_t>(t) / static_cast<size_t>(T);
         while (pos < total && blob[pos] != '\n') ++pos;
         if (pos < total) ++pos;
-        starts[t] = pos;
+        starts[static_cast<size_t>(t)] = pos;
     }
 
     vector<vector<float>> partes(static_cast<size_t>(T));
@@ -219,10 +253,10 @@ static bool leerArchivo(const char* ruta, vector<float>& out) {
     #pragma omp parallel num_threads(T)
     {
         const int tid = omp_get_thread_num();
-        const char* p   = blob.data() + starts[tid];
-        const char* end = blob.data() + starts[tid + 1];
+        const char* p   = blob.data() + starts[static_cast<size_t>(tid)];
+        const char* end = blob.data() + starts[static_cast<size_t>(tid) + 1];
 
-        vector<float>& local = partes[tid];
+        vector<float>& local = partes[static_cast<size_t>(tid)];
         local.reserve(reserveHint);
 
         while (p < end) {
@@ -237,25 +271,26 @@ static bool leerArchivo(const char* ruta, vector<float>& out) {
         }
     }
 
-    // Prefix-sum the per-thread counts.
     vector<size_t> offsets(static_cast<size_t>(T) + 1, 0);
-    for (int t = 0; t < T; ++t) offsets[t + 1] = offsets[t] + partes[t].size();
-    const size_t totalCount = offsets[T];
+    for (int t = 0; t < T; ++t)
+        offsets[static_cast<size_t>(t) + 1] =
+            offsets[static_cast<size_t>(t)] + partes[static_cast<size_t>(t)].size();
 
-    out.resize(totalCount);
+    out.resize(offsets[static_cast<size_t>(T)]);
 
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < T; ++t) {
-        if (!partes[t].empty()) {
-            memcpy(out.data() + offsets[t],
-                   partes[t].data(),
-                   partes[t].size() * sizeof(float));
+        const auto& part = partes[static_cast<size_t>(t)];
+        if (!part.empty()) {
+            std::memcpy(out.data() + offsets[static_cast<size_t>(t)],
+                        part.data(),
+                        part.size() * sizeof(float));
         }
     }
     return true;
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 int main() {
     ios_base::sync_with_stdio(false);
     cin.tie(nullptr);
@@ -265,38 +300,35 @@ int main() {
     omp_set_num_threads(static_cast<int>(hc));
 
     vector<float> numbers;
-
-    // --- Load --------------------------------------------------------------
-    auto loadStart = chrono::high_resolution_clock::now();
     if (!leerArchivo("datos.txt", numbers)) {
         cout << "ERROR: no se pudo abrir 'datos.txt'\n";
         return 1;
     }
-    auto loadEnd = chrono::high_resolution_clock::now();
-    auto loadMs  = chrono::duration_cast<chrono::milliseconds>(loadEnd - loadStart);
 
-    cout << "Vector (size): "  << numbers.size() << '\n';
-    cout << "Tiempo de carga: " << loadMs.count() << " mili.\n";
-    cout << "Hilos: "          << hc << '\n';
+    cout << "Vector (size): " << numbers.size() << endl;
 
-    // --- Sort --------------------------------------------------------------
+    // Touch every page once so the first OMP loop doesn't pay first-touch
+    // page-fault costs inside the timed region.
+    {
+        volatile float sink = 0.0f;
+        const size_t n = numbers.size();
+        #pragma omp parallel for schedule(static)
+        for (long long i = 0; i < static_cast<long long>(n); ++i) {
+            sink = numbers[i];
+        }
+        (void)sink;
+    }
+
     auto start = chrono::high_resolution_clock::now();
 
-    if (numbers.size() > 1) {
-        vector<float> buffer(numbers);                  // single auxiliary buffer
-
-        #pragma omp parallel
-        {
-            #pragma omp single nowait
-            mergeSort(buffer.data(), numbers.data(), 0, numbers.size() - 1);
-        }
-    }
+    // ===== INJECTED PARALLEL RADIX SORT ====================================
+    sortFloats(numbers);
+    // =======================================================================
 
     auto end      = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
-    cout << "Tiempo: " << duration.count() << " mili." << '\n';
 
-    // --- Verify ------------------------------------------------------------
-    cout << "Ordenado: " << (validar_orden(numbers) ? "Sí" : "No") << '\n';
+    cout << "Tiempo: " << duration.count() << " mili." << endl;
+    cout << "Ordenado: " << (validar_orden(numbers) ? "Sí" : "No") << endl;
     return 0;
 }
